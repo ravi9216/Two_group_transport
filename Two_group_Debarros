@@ -1,0 +1,338 @@
+import numpy as np
+import torch
+
+class ANNSlabSolver(object):
+    """
+    Solver for the slab geometry neutron transport equation using neural networks.
+    The ANN uses a single hidden layer.
+    """
+
+    def __init__(self, N=4, n_nodes=4, n_points_z=50, z_max=100., sigma_t1=1., sigma_t2=1.2,
+                 sigma_s11=0.9, sigma_s12=0.2, sigma_s21=0.05, sigma_s22=0.8, source=0.5, source_fraction=0.5,
+                 gamma_l=50, gamma_r=50, learning_rate=1e-3, eps=1e-8,
+                 use_weights=False):
+        """
+        Parameters
+        ==========
+        N : int
+            Order of the Legendre-Gauss quadratures.
+        n_nodes : int
+            Number of nodes in the hidden layer of the neural net.
+        n_points_z : int
+            Number of spatial points
+        z_max : float, default=8
+            Maximum position along the z-axis.
+        sigma_t : float, default=1.
+            Total macroscopic cross section.
+        sigma_s0
+        sigma_s1
+        source
+            Magnitude of the external source
+        source_fraction
+            Fraction of the slab covered by the source
+        source_mag
+        learning_rate
+            Learning rate of the Adam optimizer.
+        eps : float, default=1e-8
+            Convergence criterion.
+        random_state : int, default=None
+            If not None, use this value for seeding random initializations in
+            the neural network.
+        use_weights : bool, default=False
+            Use updated residual weights in minimizing the loss.
+        """
+
+        ########################################
+        #### Angular Meshing
+        ########################################
+
+        # Check that the quadrature order is nonzero and a multiple of two.
+        assert N > 0
+        assert N % 2 == 0
+        self.N = N
+
+        # Get the Legendre-Gauss quadratures
+        mu, w = np.polynomial.legendre.leggauss(N)
+        self.mu = mu
+        self.w = w
+        # Put the quadratures into tensors
+        mu_t = torch.tensor(mu.astype(np.float32))
+        w_t = torch.tensor(w.astype(np.float32))
+        self.mu_t = mu_t
+        self.w_t = w_t
+
+        ########################################
+        #### Spatial Meshing
+        ########################################
+        self.n_points_z = n_points_z
+        self.z_max = z_max
+
+        # Define an array of float32 x values
+        z = np.linspace(0, z_max, n_points_z, dtype=np.float32)
+        #z = np.array([0, 20, 56, 80, 100], dtype=np.float32)
+        self.z = z
+        #print(self.z)
+
+        # Now turn this array into a PyTorch tensor, stacked as a column
+        # (hence the [:,None])
+        z_t = torch.from_numpy(z[:, None])
+        # In this case, we want to track the gradients with respect to x,
+        # so specify that here
+        z_t = torch.autograd.Variable(z_t, requires_grad=True)
+        self.z_t = z_t
+        #print(self.z_t)
+        ########################################
+        #### Constants
+        ########################################
+        sigma_t1 = sigma_t1*np.ones((n_points_z,1),dtype=np.float32)
+        sigma_t1[int(n_points_z*(20/100)):int(n_points_z*(56/100)),:] = .9
+        sigma_t1[int(n_points_z*(56/100)):int(n_points_z*(80/100)),:] = 1.1
+        sigma_t1[int(n_points_z*(80/100)):,:] = 1.0
+        sigma_t1_t = torch.from_numpy(sigma_t1)
+        self.sigma_t1_t = sigma_t1_t
+        sigma_t2 = sigma_t2*np.ones((n_points_z,1),dtype=np.float32)
+        sigma_t2[int(n_points_z*(1/5)):int(n_points_z*(56/100)),:] = 1.5
+        sigma_t2[int(n_points_z*(56/100)):int(n_points_z*(80/100)),:] = .85
+        sigma_t2[int(n_points_z*(4/5)):,:] = 1.2
+        sigma_t2_t = torch.from_numpy(sigma_t2)		
+        self.sigma_t2_t = sigma_t2_t
+        sigma_s11 = sigma_s11*np.ones((n_points_z,1),dtype=np.float32)
+        sigma_s11[int(n_points_z*(1/5)):int(n_points_z*(56/100)),:] = .75
+        sigma_s11[int(n_points_z*(56/100)):int(n_points_z*(80/100)),:] = .95
+        sigma_s11[int(n_points_z*(4/5)):,:] = .9
+        sigma_s11_t = torch.from_numpy(sigma_s11)		
+        self.sigma_s11_t = sigma_s11_t
+        sigma_s12 = sigma_s12*np.ones((n_points_z,1),dtype=np.float32)
+        sigma_s12[int(n_points_z*(1/5)):int(n_points_z*(56/100)),:] = .3
+        sigma_s12[int(n_points_z*(56/100)):int(n_points_z*(4/5)),:] = .6
+        sigma_s12[int(n_points_z*(4/5)):,:] = .2
+        sigma_s12_t = torch.from_numpy(sigma_s12)		
+        self.sigma_s12_t = sigma_s12_t		
+        sigma_s21 = sigma_s21*np.ones((n_points_z,1),dtype=np.float32)
+        sigma_s21[int(n_points_z*(1/5)):int(n_points_z*(56/100)),:] = .1
+        sigma_s21[int(n_points_z*(56/100)):int(n_points_z*(4/5)),:] = 0.0
+        sigma_s21[int(n_points_z*(4/5)):,:] = .05
+        sigma_s21_t = torch.from_numpy(sigma_s21)		
+        self.sigma_s21_t = sigma_s21_t
+        sigma_s22 = sigma_s22*np.ones((n_points_z,1),dtype=np.float32)
+        sigma_s22[int(n_points_z*(1/5)):int(n_points_z*(56/100)),:] = .99
+        sigma_s22[int(n_points_z*(56/100)):int(n_points_z*(4/5)),:] = .2
+        sigma_s22[int(n_points_z*(4/5)):,:] = .8
+        sigma_s22_t = torch.from_numpy(sigma_s22)		
+        self.sigma_s22_t = sigma_s22_t
+
+		
+
+        # Set data on the external source
+        Q1 = source * np.ones((n_points_z, N), dtype=np.float32)
+        #Q[int(n_points_z*source_fraction):, :] = 0
+        Q1[int(n_points_z*(1/5)):int(n_points_z*(56/100)),:] = 0.0
+        Q1[int(n_points_z*(56/100)):int(n_points_z*(4/5)),:] = 0
+        Q1[int(n_points_z*(4/5)):,:] = 0
+        Q1_t = torch.from_numpy(Q1)
+        self.Q1_t = Q1_t
+        Q2 = source * np.ones((n_points_z, N), dtype=np.float32)
+        #Q[int(n_points_z*source_fraction):, :] = 0
+        Q2[int(n_points_z*(1/5)):int(n_points_z*(56/100)),:] = 0.0
+        Q2[int(n_points_z*(56/100)):int(n_points_z*(4/5)),:] = 0
+        Q2[int(n_points_z*(4/5)):,:] = 0
+        Q2_t = torch.from_numpy(Q2)
+        self.Q2_t = Q2_t
+
+        ########################################
+        #### Neural Network Parameters
+        ########################################
+
+        # Enforce some requirements on the hidden layer size
+        assert n_nodes >= 1
+        self.n_nodes = n_nodes
+
+        self._build_model()
+
+        assert learning_rate > 0
+        self.learning_rate = learning_rate
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
+
+        # Set regularization coefficients
+        self.gamma_l = gamma_l
+        self.gamma_r = gamma_r
+
+        # Set the convergence criterion
+        self.eps = eps
+
+        self.use_weights = use_weights
+        self.gamma = torch.ones(self.n_points_z).reshape(-1, 1)
+        self.r_squared_opt = (eps / n_points_z *
+                             torch.ones(n_points_z).reshape(-1, 1))
+
+    def _build_model(self):
+        """
+        Build neural network model.
+        """
+        model = torch.nn.Sequential(torch.nn.Linear(1, self.n_nodes),
+                                    torch.nn.Tanh(),
+                                    torch.nn.Linear(self.n_nodes, self.N),)
+
+        self.model = model
+
+    def _loss(self, y_pred_1, y_pred_2, z):
+        """
+        Loss function for the network
+        """
+
+        # Calculate the isotropic flux
+        phi_0_1 = self._compute_scalar_flux(psi=y_pred_1).reshape(-1, 1)
+        phi_0_2 = self._compute_scalar_flux(psi=y_pred_2).reshape(-1, 1)
+        phi_1_1 = torch.matmul(y_pred_1, self.mu_t * self.w_t).reshape(-1, 1)
+        phi_1_2 = torch.matmul(y_pred_2, self.mu_t * self.w_t).reshape(-1, 1)
+
+        # Create a placeholder for the gradient
+        grad_1 = torch.empty_like(y_pred_1)
+
+        # Compute the gradient of each output with respect to the input
+        for idx in range(y_pred_1.shape[1]):
+            g, = torch.autograd.grad(y_pred_1[:, idx], z,
+                 grad_outputs=y_pred_1.data.new(y_pred_1.shape[0]).fill_(1),
+                 create_graph=True)
+            grad_1[:, idx] = g.flatten()
+			
+        # Create a placeholder for the gradient
+        grad_2 = torch.empty_like(y_pred_2)
+
+        # Compute the gradient of each output with respect to the input
+        for idx in range(y_pred_2.shape[1]):
+            g, = torch.autograd.grad(y_pred_2[:, idx], z,
+                 grad_outputs=y_pred_2.data.new(y_pred_2.shape[0]).fill_(1),
+                 create_graph=True)
+            grad_2[:, idx] = g.flatten()
+
+        # Compute the loss
+        l1 = (self.mu_t * grad_1 + self.sigma_t1_t * y_pred_1 + self.mu_t * grad_2 + self.sigma_t2_t * y_pred_2 - 0.5 * (self.sigma_s12_t * phi_0_1 + self.sigma_s11_t * phi_0_1 + self.sigma_s21_t * phi_0_2 + self.sigma_s22_t * phi_0_2) - 0.5 * self.Q1_t -0.5 * self.Q2_t)**2
+              
+                       
+              
+
+        self.r_squared = l1.sum(1).reshape(-1, 1)
+        loss = 0.5 * torch.dot(self.gamma.flatten(), self.r_squared.flatten()).reshape(1)
+
+        # Use the previous squared error as the weights
+        if self.use_weights:
+            rho = torch.max(torch.ones_like(self.r_squared),
+                            torch.abs(torch.log(self.r_squared_opt)/
+                                      torch.log(self.r_squared)))
+            omega = phi_0 / phi_0.max()
+            self.gamma = torch.max(torch.ones_like(rho), rho / omega)
+
+        # Add a penalty relating to the boundary conditions
+        loss += 0.5 * self.gamma_l * ((y_pred_1[0, self.N//2:])**2).sum().reshape(1)
+        loss += 0.5 * self.gamma_r * ((y_pred_1[-1, :self.N//2])**2).sum().reshape(1)
+        loss += 0.5 * self.gamma_l * ((y_pred_2[0, self.N//2:])**2).sum().reshape(1)
+        loss += 0.5 * self.gamma_r * ((y_pred_2[-1, :self.N//2])**2).sum().reshape(1)
+
+        return torch.sum(loss)
+
+    def train(self, interval=500, num_iterations_estimate=2**20):
+        """
+        Train the neural network.
+        interval : int
+            Interval at which loss is printed.
+        """
+
+        loss_history = np.zeros(num_iterations_estimate)
+        prev_loss = 1e6
+        f = open("flux_2grp2.txt","w+")	
+        it = 0
+        while True:
+            # First, compute the estimate, which is known as the forward pass
+            y_pred_1 = self.model(self.z_t)
+            y_pred_2 = self.model(0.75 * self.z_t)
+	    
+            # Compute the loss between the prediction and true value
+            loss = self._loss(y_pred_1, y_pred_2, self.z_t)
+            loss_history[it] = loss
+
+            # Inspect the value of the loss
+            if it % interval == 0:
+                print(f'Iter {it}:', loss.item())
+                print(f'Iter {it}:', loss.item(),file=f)
+                phi_0_1 = torch.matmul(y_pred_1, self.w_t)
+                phi_0_2 = torch.matmul(y_pred_2, self.w_t)
+                print(phi_0_1)
+                print(f'phi_0_1:',phi_0_1,file=f)
+                print(phi_0_2)
+                print(f'phi_0_2:',phi_0_2,file=f)
+
+            self.optimizer.zero_grad()
+
+            # Peform the backwards propagation of gradients
+            loss.backward(retain_graph=True)
+
+            # Now update the parameters using the newly-calculated gradients
+            self.optimizer.step()
+
+            loss = loss.item()
+
+            err = np.abs(loss - prev_loss)
+            prev_loss = loss
+
+            if err < self.eps:
+                break
+            it +=1
+        f.close()
+        return np.trim_zeros(loss_history)
+
+    def _compute_scalar_flux(self, z=None, psi=None, numpy=False):
+        """
+        Compute the scalar flux at points z.
+        Parameters
+        ==========
+        z : torch tensor, shape (1, n_points_z)
+            Spatial variable to compute flux at.
+        numpy : bool, default=False
+            If True, return a numpy array. Otherwise return a torch tensor.
+        Returns
+        =======
+        phi_0 : array-like, shape (n_points_z)
+            The predicted scalar flux from the neural network at each z-point.
+        """
+
+        if psi is None:
+            psi =  self.model(z)
+
+        phi_0 = torch.matmul(psi, self.w_t)
+
+        if not numpy:
+            return phi_0
+        else:
+            return phi_0.detach().numpy()
+
+    def predict(self, z=None):
+        """
+        Predict the flux at spatial positions z. If z is None, use the
+        same spatial variables that were used in training the network.
+        Parameters
+        ==========
+        z : array-like, shape (n_points_z)
+            Spatial variable to compute flux at.
+        Returns
+        =======
+        phi : array-like, shape (n_points_z)
+            The predicted flux from the neural network at each z-point.
+        """
+
+        # Use the existing spatial values if none are provided
+        if z is None:
+            return self._compute_scalar_flux(z=self.z_t, numpy=True)
+
+        # Otherwise, compute flux on the new spatial values
+        return self._compute_scalar_flux(z=torch.tensor(z[:, None]), numpy=True)
+if __name__ == '__main__':
+    # Instantiate the class using default parameters
+    solver = ANNSlabSolver()
+
+    # Train the ANN
+    solver.train()
+
+    # Get an estimate of the scalar flux
+    flux = solver.predict()
+    
